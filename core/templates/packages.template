@@ -1,4 +1,4 @@
-;;; packages.el --- NAME Layer packages File for Spacemacs
+;;; packages.el --- %LAYERNAME% Layer packages File for Spacemacs
 ;;
 ;; Copyright (c) 2012-2014 Sylvain Benner
 ;; Copyright (c) 2014-2015 Sylvain Benner & Contributors
@@ -10,19 +10,19 @@
 ;;
 ;;; License: GPLv3
 
-(defvar NAME-packages
-  '(
-    ;; package names go here
-    )
-  "List of all packages to install and/or initialize. Built-in packages
-which require an initialization must be listed explicitly in the list.")
+;; List of all packages to install and/or initialize. Built-in packages
+;; which require an initialization must be listed explicitly in the list.
+(setq %LAYERNAME%-packages
+    '(
+      ;; package names go here
+      ))
 
-(defvar NAME-excluded-packages '()
-  "List of packages to exclude.")
+;; List of packages to exclude.
+(setq %LAYERNAME%-excluded-packages '())
 
-;; For each package, define a function NAME/init-<package-name>
+;; For each package, define a function %LAYERNAME%/init-<package-name>
 ;;
-;; (defun NAME/init-my-package ()
+;; (defun %LAYERNAME%/init-my-package ()
 ;;   "Initialize my package"
 ;;   )
 ;;

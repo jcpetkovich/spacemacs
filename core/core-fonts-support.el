@@ -12,6 +12,9 @@
 (require 'core-funcs)
 (require 'core-spacemacs-buffer)
 
+(defvar spacemacs--diminished-minor-modes nil
+  "List of diminished modes to unicode or ascii values.")
+
 (defun spacemacs/set-default-font (plist)
   "Set the font given the passed PLIST.
 
@@ -22,7 +25,8 @@ PLIST has the form (\"fontname\" :prop1 val1 :prop2 val2 ...)"
          (font-props (spacemacs/mplist-remove
                       (spacemacs/mplist-remove props :powerline-scale)
                       :powerline-offset))
-         (fontspec (apply 'font-spec :family font font-props)))
+         (fontspec (apply 'font-spec :name font font-props)))
+    (spacemacs-buffer/message "Setting font \"%s\"..." font)
     (set-default-font fontspec nil t)
     (setq-default powerline-scale scale)
     (setq-default powerline-height (spacemacs/compute-powerline-height))
@@ -37,6 +41,9 @@ PLIST has the form (\"fontname\" :prop1 val1 :prop2 val2 ...)"
       (`windows-nt
        (setq fallback-font-name "MS Gothic")
        (setq fallback-font-name2 "Lucida Sans Unicode"))
+      (`cygwin
+       (setq fallback-font-name "MS Gothic")
+       (setq fallback-font-name2 "Lucida Sans Unicode"))
       (other
        (setq fallback-font-name nil)
        (setq fallback-font-name2 nil)))
@@ -48,10 +55,10 @@ PLIST has the form (\"fontname\" :prop1 val1 :prop2 val2 ...)"
                               (spacemacs/mplist-remove font-props :size)
                               :height))
              (fallback-spec (apply 'font-spec
-                                   :family fallback-font-name
+                                   :name fallback-font-name
                                    fallback-props))
              (fallback-spec2 (apply 'font-spec
-                                    :family fallback-font-name2
+                                    :name fallback-font-name2
                                     fallback-props)))
         ;; window numbers
         (set-fontset-font "fontset-default"
@@ -59,7 +66,7 @@ PLIST has the form (\"fontname\" :prop1 val1 :prop2 val2 ...)"
         ;; mode-line circled letters
         (set-fontset-font "fontset-default"
                           '(#x24b6 . #x24fe) fallback-spec nil 'prepend)
-        ;; mode-line additional characters (i.e. golden ratio)
+        ;; mode-line additional characters
         (set-fontset-font "fontset-default"
                           '(#x2295 . #x22a1) fallback-spec nil 'prepend)
         ;; new version lighter
@@ -75,10 +82,20 @@ PLIST has the form (\"fontname\" :prop1 val1 :prop2 val2 ...)"
 
 (defun spacemacs/set-font (&rest args)
   "Deprecated function, display a warning message."
-  (spacemacs/message (concat "Warning: spacemacs/set-font is deprecated. "
+  (spacemacs-buffer/warning (concat "spacemacs/set-font is deprecated. "
                              "Use the variable `dotspacemacs-default-font' "
                              "instead (see Font section in "
-                             "~/.emacs.d/doc/DOCUMENTATION.md for more "
+                             "~/.emacs.d/doc/DOCUMENTATION.org for more "
                              "info).")))
+
+(defmacro spacemacs|diminish (mode unicode &optional ascii)
+  "Diminish MODE name in mode line to UNICODE or ASCII depending on the value
+`dotspacemacs-mode-line-unicode-symbols'.
+If ASCII si not provided then UNICODE is used instead."
+  `(add-to-list 'spacemacs--diminished-minor-modes '(,mode ,unicode ,ascii)))
+
+(defmacro spacemacs|hide-lighter (mode)
+  "Diminish MODE name in mode line to LIGHTER."
+  `(eval-after-load 'diminish '(diminish ',mode)))
 
 (provide 'core-fonts-support)

@@ -9,442 +9,965 @@
 ;; This file is not part of GNU Emacs.
 ;;
 ;;; License: GPLv3
-(require 'ht)
+;;
+;;; Commentary:
+;;
+;;; Code:
+
+(require 'cl-lib)
+(require 'eieio)
 (require 'package)
+(require 'warnings)
+(require 'ht)
 (require 'core-dotspacemacs)
 (require 'core-funcs)
 (require 'core-spacemacs-buffer)
 
 (unless package--initialized
-  (setq package-archives '(("ELPA" . "http://tromey.com/elpa/")
-                           ("gnu" . "http://elpa.gnu.org/packages/")
-                           ("melpa" . "http://melpa.org/packages/")))
+  (setq package-archives '(("melpa" . "http://melpa.org/packages/")
+                           ("org" . "http://orgmode.org/elpa/")
+                           ("gnu" . "http://elpa.gnu.org/packages/")))
   ;; optimization, no need to activate all the packages so early
+  (setq package-enable-at-startup nil)
   (package-initialize 'noactivate)
   ;; Emacs 24.3 and above ships with python.el but in some Emacs 24.3.1 packages
   ;; for Ubuntu, python.el seems to be missing.
   ;; This hack adds marmalade repository for this case only.
   (unless (or (package-installed-p 'python) (version< emacs-version "24.3"))
     (add-to-list 'package-archives
-                 '("marmalade" . "http://marmalade-repo.org/packages/")))
-  (setq warning-minimum-level :error))
+                 '("marmalade" . "https://marmalade-repo.org/packages/"))))
 
 (defconst configuration-layer-template-directory
   (expand-file-name (concat spacemacs-core-directory "templates/"))
   "Configuration layer templates directory.")
 
-(defconst configuration-layer-contrib-directory
-  (expand-file-name (concat user-emacs-directory "contrib/"))
+(defconst configuration-layer-directory
+  (expand-file-name (concat user-emacs-directory "layers/"))
   "Spacemacs contribution layers base directory.")
 
 (defconst configuration-layer-private-directory
   (expand-file-name (concat user-emacs-directory "private/"))
   "Spacemacs private layers base directory.")
 
-(defvar configuration-layer-layers '()
-  "Alist of declared configuration layers.")
+(defconst configuration-layer-private-layer-directory
+  (let ((dotspacemacs-layer-dir
+         (when dotspacemacs-directory
+           (expand-file-name
+            (concat dotspacemacs-directory "layers/")))))
+    (if (and dotspacemacs-directory
+             (file-exists-p dotspacemacs-layer-dir))
+        dotspacemacs-layer-dir
+      configuration-layer-private-directory))
+  "Spacemacs default directory for private layers.")
 
-(defvar configuration-layer-paths (make-hash-table :size 128)
+(defconst configuration-layer-rollback-directory
+  (expand-file-name (concat spacemacs-cache-directory ".rollback/"))
+  "Spacemacs rollback directory.")
+
+(defconst configuration-layer-rollback-info "rollback-info"
+  "Spacemacs rollback information file.")
+
+(defclass cfgl-layer ()
+  ((name :initarg :name
+         :type symbol
+         :documentation "Name of the layer.")
+   (dir :initarg :dir
+        :type string
+        :documentation "Absolute path to the layer directory.")
+   (variables :initarg :variables
+              :initform nil
+              :type list
+              :documentation "A list of variable-value pairs.")
+   (disabled :initarg :disabled-for
+             :initform nil
+             :type list
+             :documentation "A list of layer where this layer is disabled."))
+  "A configuration layer.")
+
+(defclass cfgl-package ()
+  ((name :initarg :name
+         :type symbol
+         :documentation "Name of the package.")
+   (owner :initarg :owner
+          :initform nil
+          :type symbol
+          :documentation "The layer defining the init function.")
+   (pre-layers :initarg :pre-layers
+               :initform '()
+               :type list
+               :documentation "Layers with a pre-init function.")
+   (post-layers :initarg :post-layers
+               :initform '()
+               :type list
+               :documentation "Layers with a post-init function.")
+   (location :initarg :location
+             :initform elpa
+             :type (satisfies (lambda (x)
+                                (or (member x '(built-in local elpa))
+                                    (and (listp x) (eq 'recipe (car x))))))
+             :documentation "Location of the package.")
+   (step :initarg :step
+         :initform nil
+         :type (satisfies (lambda (x) (member x '(nil pre))))
+         :documentation "Initialization step.")
+   (excluded :initarg :excluded
+             :initform nil
+             :type boolean
+             :documentation
+             "If non-nil this package is excluded from all layers.")))
+
+(defvar configuration-layer--layers '()
+  "A non-sorted list of `cfgl-layer' objects.")
+
+(defvar configuration-layer--packages '()
+  "An alphabetically sorted list of `cfgl-package' objects.")
+
+(defvar configuration-layer--used-distant-packages '()
+  "A list of all distant packages that are effectively used.")
+
+(defvar configuration-layer--skipped-packages nil
+  "A list of all packages that were skipped during last update attempt.")
+
+(defvar configuration-layer--protected-packages nil
+  "A list of packages that will be protected from removal as orphans.")
+
+(defvar configuration-layer-error-count nil
+  "Non nil indicates the number of errors occurred during the
+installation of initialization.")
+
+(defvar configuration-layer-paths (make-hash-table :size 256)
   "Hash table of layers locations. The key is a layer symbol and the value is
 the path for this layer.")
 
-(defvar configuration-layer-all-packages (make-hash-table :size 256)
-  "Hash table of all declared packages in all layers where the key is a package
-symbol and the value is a list of layer symbols responsible for initializing
-and configuring the package.")
-
-(defvar configuration-layer-all-packages-sorted '()
-  "Sorted list of all package symbols.")
-
-(defvar configuration-layer-all-pre-extensions (make-hash-table :size 128)
-  "Hash table of all declared pre-extensions in all layers where the key is a
-extension symbol and the value is the layer symbols responsible for initializing
-and configuring the package.")
-
-(defvar configuration-layer-all-pre-extensions-sorted '()
-  "Sorted list of all pre extensions symbols.")
-
-(defvar configuration-layer-all-post-extensions (make-hash-table :size 128)
-  "Hash table of all declared post-extensions in all layers where the key is a
-extension symbol and the value is the layer symbols responsible for initializing
-and configuring the package.")
-
-(defvar configuration-layer-all-post-extensions-sorted '()
-  "Sorted list of all post extensions symbols.")
-
-(defvar configuration-layer-contrib-categories '("usr" "lang")
+(defvar configuration-layer-categories '()
   "List of strings corresponding to category names. A category is a
-sub-directory of the contribution directory.")
+directory with a name starting with `+'.")
 
-(defvar configuration-layer-excluded-packages '()
-  "List of all excluded packages declared at the layer level.")
+(defun configuration-layer/sync ()
+  "Synchronize declared layers in dotfile with spacemacs."
+  (dotspacemacs|call-func dotspacemacs/layers "Calling dotfile layers...")
+  (when (spacemacs-buffer//choose-banner)
+    (spacemacs-buffer//inject-version t))
+  ;; layers
+  (setq configuration-layer--layers (configuration-layer//declare-layers))
+  (configuration-layer//configure-layers configuration-layer--layers)
+  ;; packages
+  (setq configuration-layer--packages (configuration-layer//declare-packages
+                                      configuration-layer--layers))
+  (setq configuration-layer--used-distant-packages
+        (configuration-layer//get-distant-used-packages
+         configuration-layer--packages))
+  (configuration-layer//load-packages configuration-layer--packages)
+  (when dotspacemacs-delete-orphan-packages
+    (configuration-layer/delete-orphan-packages configuration-layer--packages)))
 
-(defvar configuration-layer--loaded-files '()
-  "List of loaded files.")
-
-(defun configuration-layer/create-layer (name)
-  "Ask the user for a configuration layer name and create a layer with this
-name in the private layers directory."
-  (interactive "sConfiguration layer name: ")
-  (let ((layer-dir (configuration-layer//get-private-layer-dir name)))
+(defun configuration-layer/create-layer ()
+  "Ask the user for a configuration layer name and the layer
+directory to use. Create a layer with this name in the selected
+layer directory."
+  (interactive)
+  (let* ((current-layer-paths (mapcar (lambda (dir) (expand-file-name dir))
+                                      (cl-pushnew
+                               configuration-layer-private-layer-directory
+                               dotspacemacs-configuration-layer-path)))
+         (other-choice "Another directory...")
+         (helm-lp-source
+          `((name . "Configuration Layer Paths")
+            (candidates . ,(append current-layer-paths
+                                   (list other-choice)))
+            (action . (lambda (c) c))))
+         (layer-path-sel (helm :sources helm-lp-source
+                               :prompt "Configuration layer path: "))
+         (layer-path (cond
+                      ((string-equal layer-path-sel other-choice)
+                       (read-directory-name (concat "Other configuration "
+                                                    "layer path: ") "~/" ))
+                      ((member layer-path-sel current-layer-paths)
+                       layer-path-sel)
+                      (t
+                       (error "Please select an option from the list"))))
+         (name (read-from-minibuffer "Configuration layer name: " ))
+         (layer-dir (concat layer-path "/" name)))
     (cond
      ((string-equal "" name)
       (message "Cannot create a configuration layer without a name."))
      ((file-exists-p layer-dir)
-      (message "Cannot create configuration layer \"%s\", this layer already exists."
-               name))
+      (message (concat "Cannot create configuration layer \"%s\", "
+                       "this layer already exists.") name))
      (t
-      (make-directory layer-dir)
-      (configuration-layer//copy-template "extensions")
-      (configuration-layer//copy-template "packages")
-      (message "Configuration layer \"%s\" successfully created." name))
-  )))
+      (make-directory layer-dir t)
+      (configuration-layer//copy-template name "extensions" layer-dir)
+      (configuration-layer//copy-template name "packages" layer-dir)
+      (message "Configuration layer \"%s\" successfully created." name)))))
+
+(defun configuration-layer/make-layer (layer)
+  "Return a `cfgl-layer' object based on LAYER."
+  (let* ((name-sym (if (listp layer) (car layer) layer))
+         (name-str (symbol-name name-sym))
+         (base-dir (configuration-layer/get-layer-path name-sym))
+         (disabled (when (listp layer)
+                     (spacemacs/mplist-get layer :disabled-for)))
+         (variables (when (listp layer)
+                      (spacemacs/mplist-get layer :variables))))
+    (if base-dir
+        (let* ((dir (format "%s%s/" base-dir name-str)))
+          (cfgl-layer name-str
+                      :name name-sym
+                      :dir dir
+                      :disabled-for disabled
+                      :variables variables))
+      (spacemacs-buffer/warning "Cannot find layer %S !" name-sym)
+      nil)))
+
+(defun configuration-layer//make-layers (symbols)
+  "Make `cfgl-layer' objects from the passed layer SYMBOLS."
+  (delq nil (mapcar 'configuration-layer/make-layer symbols)))
+
+(defun configuration-layer/make-package (pkg &optional obj)
+  "Return a `cfgl-package' object based on PKG.
+If OBJ is non nil then copy PKG properties into OBJ, otherwise create
+a new object.
+Properties that can be copied are `:location', `:step' and `:excluded'."
+  (let* ((name-sym (if (listp pkg) (car pkg) pkg))
+         (name-str (symbol-name name-sym))
+         (location (when (listp pkg) (plist-get (cdr pkg) :location)))
+         (step (when (listp pkg) (plist-get (cdr pkg) :step)))
+         (excluded (when (listp pkg) (plist-get (cdr pkg) :excluded)))
+         (obj (if obj obj (cfgl-package name-str :name name-sym))))
+    (when location (oset obj :location location))
+    (when step (oset obj :step step))
+    (oset obj :excluded excluded)
+    obj))
+
+(defun configuration-layer/get-packages (layers &optional dotfile)
+  "Read the package lists of LAYERS and dotfile and return a list of packages."
+  (let (result)
+    (dolist (layer layers)
+      (let* ((name (oref layer :name))
+             (dir (oref layer :dir))
+             (packages-file (concat dir "packages.el"))
+             (extensions-file (concat dir "extensions.el")))
+        ;; packages
+        (when (file-exists-p packages-file)
+          ;; required for lazy-loading of unused layers
+          ;; for instance for helm-spacemacs
+          (eval `(defvar ,(intern (format "%S-packages" name)) nil))
+          (unless (configuration-layer/layer-usedp name)
+            (load packages-file))
+          (dolist (pkg (symbol-value (intern (format "%S-packages" name))))
+            (let* ((pkg-name (if (listp pkg) (car pkg) pkg))
+                   (init-func (intern (format "%S/init-%S"
+                                              name pkg-name)))
+                   (pre-init-func (intern (format "%S/pre-init-%S"
+                                                  name pkg-name)))
+                   (post-init-func (intern (format "%S/post-init-%S"
+                                                   name pkg-name)))
+                   (obj (object-assoc pkg-name :name result)))
+              (if obj
+                  (setq obj (configuration-layer/make-package pkg obj))
+                (setq obj (configuration-layer/make-package pkg))
+                (push obj result))
+              (when (fboundp init-func)
+                ;; last owner wins over the previous one,
+                ;; still warn about mutliple owners
+                (when (oref obj :owner)
+                  (spacemacs-buffer/warning
+                   (format (concat "More than one init function found for "
+                                   "package %S. Previous owner was %S, "
+                                   "replacing it with layer %S.")
+                           pkg (oref obj :owner) name)))
+                (oset obj :owner name))
+              (when (fboundp pre-init-func)
+                (push name (oref obj :pre-layers)))
+              (when (fboundp post-init-func)
+                (push name (oref obj :post-layers)))))
+          ;; TODO remove support for <layer>-excluded-packages in 0.105.0
+          (let ((xvar (intern (format "%S-excluded-packages" name))))
+            (when (boundp xvar)
+              (dolist (xpkg (symbol-value xvar))
+                (let ((obj (object-assoc xpkg :name result)))
+                  (unless obj
+                    (setq obj (configuration-layer/make-package xpkg))
+                    (push obj result))
+                  (oset obj :excluded t))))))
+        ;; extensions (dummy duplication of the code above)
+        ;; TODO remove extensions in 0.105.0
+        (when (file-exists-p extensions-file)
+          ;; required for lazy-loading of unused layers
+          ;; for instance for helm-spacemacs
+          (unless (configuration-layer/layer-usedp name)
+            (load extensions-file))
+          (dolist (step '(pre post))
+            (eval `(defvar ,(intern (format "%S-%S-extensions" name step)) nil))
+            (let ((var (intern (format "%S-%S-extensions" name step))))
+              (when (boundp var)
+                (dolist (pkg (symbol-value var))
+                  (let ((pkg-name (if (listp pkg) (car pkg) pkg)))
+                    (when (fboundp (intern (format "%S/init-%S"
+                                                   name pkg-name)))
+                      (let ((obj (configuration-layer/make-package pkg))
+                            (init-func (intern (format "%S/init-%S"
+                                                       name pkg-name)))
+                            (pre-init-func (intern (format "%S/pre-init-%S"
+                                                           name pkg-name)))
+                            (post-init-func (intern (format "%S/post-init-%S"
+                                                            name pkg-name)))
+                            (obj (object-assoc pkg :name result)))
+                        (unless obj
+                          (setq obj (configuration-layer/make-package pkg))
+                          (push obj result))
+                        (when (fboundp init-func)
+                          ;; last owner wins over the previous one,
+                          ;; still warn about mutliple owners
+                          (when (oref obj :owner)
+                            (spacemacs-buffer/warning
+                             (format (concat
+                                      "More than one init function found for "
+                                      "package %S. Previous owner was %S, "
+                                      "replacing it with layer %S.")
+                                     pkg (oref obj :owner) name)))
+                          (oset obj :owner name))
+                        (when (fboundp pre-init-func)
+                          (push name (oref obj :pre-layers)))
+                        (when (fboundp post-init-func)
+                          (push name (oref obj :post-layers)))
+                        (oset obj :location 'local)
+                        (oset obj :step (when (eq 'pre step) step))))))))))))
+    ;; additional and excluded packages from dotfile
+    (when dotfile
+      (dolist (pkg dotspacemacs-additional-packages)
+        (let* ((pkg-name (if (listp pkg) (car pkg) pkg))
+               (obj (object-assoc pkg-name :name result)))
+          (if obj
+              (setq obj (configuration-layer/make-package pkg obj))
+            (setq obj (configuration-layer/make-package pkg))
+            (push obj result)
+            (oset obj :owner 'dotfile))))
+      (dolist (xpkg dotspacemacs-excluded-packages)
+        (let ((obj (object-assoc xpkg :name result)))
+          (unless obj
+            (setq obj (configuration-layer/make-package xpkg))
+            (push obj result))
+          (oset obj :excluded t))))
+    result))
+
+(defun configuration-layer//sort-packages (packages)
+  "Return a sorted list of PACKAGES objects."
+  (sort packages (lambda (x y) (string< (symbol-name (oref x :name))
+                                        (symbol-name (oref y :name))))))
+
+(defun configuration-layer/filter-objects (objects ffunc)
+  "Return a filtered OBJECTS list where each element satisfies FFUNC."
+  (reverse (reduce (lambda (acc x)
+                     (if (funcall ffunc x) (push x acc) acc))
+                   objects
+                   :initial-value nil)))
+
+(defun configuration-layer//get-distant-used-packages (packages)
+  "Return the distant packages (ie to be intalled) that are effectively used."
+  (configuration-layer/filter-objects
+   packages (lambda (x) (and (not (null (oref x :owner)))
+                             (not (memq (oref x :location) '(built-in local)))
+                             (not (oref x :excluded))))))
 
 (defun configuration-layer//get-private-layer-dir (name)
-  "Return an absolute path the the private configuration layer with name
-NAME."
-  (concat configuration-layer-private-directory name "/"))
+  "Return an absolute path to the private configuration layer string NAME."
+  (file-name-as-directory
+   (concat configuration-layer-private-layer-directory name)))
 
-(defun configuration-layer//copy-template (template)
-  "Copy and replace special values of TEMPLATE to LAYER_DIR."
+(defun configuration-layer//copy-template (name template &optional layer-dir)
+  "Copy and replace special values of TEMPLATE to layer string NAME.
+If LAYER_DIR is nil, the private directory is used."
   (let ((src (concat configuration-layer-template-directory
                      (format "%s.template" template)))
-        (dest (concat (configuration-layer//get-private-layer-dir name)
-                      (format "%s.el" template))))
-    
+        (dest (if layer-dir
+                  (concat layer-dir "/" (format "%s.el" template))
+                (concat (configuration-layer//get-private-layer-dir name)
+                        (format "%s.el" template)))))
     (copy-file src dest)
     (find-file dest)
     (save-excursion
       (goto-char (point-min))
-      (while (re-search-forward "NAME" nil t)
-        (replace-match name t)))
+      (let ((case-fold-search nil))
+        (while (re-search-forward "%LAYERNAME%" nil t)
+          (replace-match name t))))
     (save-buffer)))
 
-(defun configuration-layer//get-contrib-category-dirs ()
-  "Return a list of all absolute paths to the contribution categories stored
-in `configuration-layer-contrib-categories'"
-  (mapcar
-   (lambda (d) (expand-file-name
-                (concat configuration-layer-contrib-directory (format "%s/" d))))
-   configuration-layer-contrib-categories))
+(defun configuration-layer//directory-type (path)
+  "Return the type of directory pointed by PATH.
+Possible return values:
+  layer    - the directory is a layer
+  category - the directory is a category
+  nil      - the directory is a regular directory."
+  (when (file-directory-p path)
+    (if (string-match
+         "^+" (file-name-nondirectory
+               (directory-file-name
+                (concat configuration-layer-directory path))))
+        'category
+      (let ((files (directory-files path)))
+        ;; most frequent files encoutered in a layer are tested first
+        (when (or (member "packages.el" files)
+                  (member "extensions.el" files)
+                  (member "config.el" files)
+                  (member "keybindings.el" files)
+                  (member "funcs.el" files))
+          'layer)))))
+
+(defun configuration-layer//get-category-from-path (dirpath)
+  "Return a category symbol from the given DIRPATH.
+The directory name must start with `+'.
+Returns nil if the directory is not a category."
+  (when (file-directory-p dirpath)
+    (let ((dirname (file-name-nondirectory
+                    (directory-file-name
+                     (concat configuration-layer-directory
+                             dirpath)))))
+      (when (string-match "^+" dirname)
+        (intern (substring dirname 1))))))
 
 (defun configuration-layer//discover-layers ()
   "Return a hash table where the key is the layer symbol and the value is its
 path."
-  (let ((cat-dirs (configuration-layer//get-contrib-category-dirs))
-        (result (make-hash-table :size 128)))
-    ;; add spacemacs layer
-    (puthash 'spacemacs (expand-file-name user-emacs-directory) result)
-    (mapc (lambda (dir)
-            (let ((layers (configuration-layer//discover-layers-in-dir dir)))
-              (mapc (lambda (layer)
-                      (puthash (car layer) (cdr layer) result))
-                    layers)))
-          (append (list configuration-layer-contrib-directory)
-                  cat-dirs
-                  dotspacemacs-configuration-layer-path
-                  ;; load private layers at the end on purpose
-                  ;; we asume that the user layers must have the final word
-                  ;; on configuration choices.
-                  (list configuration-layer-private-directory)))
+  ;; load private layers at the end on purpose we asume that the user layers
+  ;; must have the final word on configuration choices. Let
+  ;; `dotspacemacs-directory' override the private directory if it exists.
+  (let ((search-paths (append (list configuration-layer-directory)
+                              dotspacemacs-configuration-layer-path
+                              (list configuration-layer-private-layer-directory)
+                              (when dotspacemacs-directory
+                                (list dotspacemacs-directory))))
+        (discovered '())
+        (result (make-hash-table :size 256)))
+    ;; depth-first search of subdirectories
+    (while search-paths
+      (let ((current-path (car search-paths)))
+        (setq search-paths (cdr search-paths))
+        (dolist (sub (directory-files current-path t nil 'nosort))
+          ;; ignore ".", ".." and non-directories
+          (unless (or (string-equal ".." (substring sub -2))
+                      (string-equal "." (substring sub -1))
+                      (not (file-directory-p sub)))
+            (let ((type (configuration-layer//directory-type sub)))
+              (cond
+               ((eq 'category type)
+                (let ((category (configuration-layer//get-category-from-path
+                                 sub)))
+                  (spacemacs-buffer/message "-> Discovered category: %S"
+                                            category)
+                  (push category configuration-layer-categories)
+                  (setq search-paths (cons sub search-paths))))
+               ((eq 'layer type)
+                (let ((layer-name (file-name-nondirectory sub))
+                      (layer-dir (file-name-directory sub)))
+                  (spacemacs-buffer/message
+                   "-> Discovered configuration layer: %s" layer-name)
+                  (push (cons (intern layer-name) layer-dir) discovered)))
+               (t
+                ;; layer not found, add it to search path
+                (setq search-paths (cons sub search-paths)))))))))
+    ;; add discovered layers to hash table
+    (mapc (lambda (l)
+            (if (ht-contains? result (car l))
+                ;; the same layer may have been discovered twice,
+                ;; in which case we don't need a warning
+                (unless (string-equal (ht-get result (car l)) (cdr l))
+                  (spacemacs-buffer/warning
+                   (concat "Duplicated layer %s detected in directory \"%s\", "
+                           "keeping only the layer in directory \"%s\"")
+                   (car l) (cdr l) (ht-get result (car l))))
+              (puthash (car l) (cdr l) result)))
+          discovered)
     result))
 
-(defun configuration-layer//discover-layers-in-dir (dir)
-  "Return an alist where the key is a layer symbol and the value is the path
-for that layer."
-  (spacemacs/message "Looking for configuration layers in %s" dir)
-  (ignore-errors
-    (let ((files (directory-files dir nil nil 'nosort))
-          (filter-out (append configuration-layer-contrib-categories '("." "..")))
-          result '())
-      (dolist (f files)
-        (when (and (file-directory-p (concat dir f))
-                   (not (member f filter-out)))
-          (spacemacs/message "-> Discovered configuration layer: %s" f)
-          (push (cons (intern f) dir) result)))
-      result)))
-
-(defun configuration-layer/declare-all-layers ()
-  "Declare default layers and user layers from the dotfile by filling the
-`configuration-layer-layers' variable."
+(defun configuration-layer//declare-layers ()
+  "Declare default layers and user layers declared in the dotfile."
+  (setq configuration-layer--layers nil)
   (setq configuration-layer-paths (configuration-layer//discover-layers))
-  (push (configuration-layer//declare-layer 'spacemacs)
-        configuration-layer-layers)
-  (mapc (lambda (layer) (push layer configuration-layer-layers))
-        (configuration-layer//declare-layers
-         dotspacemacs-configuration-layers)))
+  (when (eq 'all dotspacemacs-configuration-layers)
+    (setq dotspacemacs-configuration-layers
+          (ht-keys configuration-layer-paths)))
+  (dolist (layer dotspacemacs-configuration-layers)
+    (let ((layer-name (if (listp layer) (car layer) layer)))
+      (if (ht-contains? configuration-layer-paths layer-name)
+          (unless (string-match-p "+distribution"
+                                  (ht-get configuration-layer-paths layer-name))
+            (push (configuration-layer/make-layer layer)
+                  configuration-layer--layers))
+        (spacemacs-buffer/warning "Unknown layer %s declared in dotfile."
+                                  layer-name))))
+  (setq configuration-layer--layers (reverse configuration-layer--layers))
+  ;; distribution layer is always first
+  (push (configuration-layer/make-layer dotspacemacs-distribution)
+        configuration-layer--layers))
 
-(defun configuration-layer//declare-layers (layers)
-  "Declare the passed configuration LAYERS.
-LAYERS is a list of layer symbols."
-  (reduce (lambda (acc elt) (push elt acc))
-          (mapcar 'configuration-layer//declare-layer layers)
-          :initial-value nil))
+(defun configuration-layer/declare-layers (layer-names)
+  "Add layer with LAYER-NAMES to used layers."
+  (mapc 'configuration-layer/declare-layer layer-names))
 
-(defun configuration-layer//declare-layer (layer)
-  "Declare a layer with NAME symbol. Return a cons cell (symbol . plist)
-where `symbol' is the name of the layer and `plist' is a property list with
-the following keys:
-- `:dir'       the absolute path to the base directory of the layer.
-- `:ext-dir'   the absolute path to the directory containing the extensions.
-- `:variables' list of layer configuration variables to set
-- `:excluded'  list of packages to exlcude."
-  (let* ((name-sym (if (listp layer) (car layer) layer))
-         (name-str (symbol-name name-sym))
-         (base-dir (configuration-layer/get-layer-path name-sym)))
-    (if base-dir
-        (let* ((dir (format "%s%s/" base-dir name-str))
-               (ext-dir (format "%sextensions/" dir))
-               (plist (append (list :dir dir :ext-dir ext-dir)
-                              (when (listp layer) (cdr layer)))))
-          (cons name-sym plist))
-      (spacemacs/message "Warning: Cannot find layer %s !" layer))))
+(defun configuration-layer/declare-layer (layer-name)
+  "Declare a single layer"
+  (unless (object-assoc layer-name :name configuration-layer--layers)
+    (let ((new-layer (configuration-layer/make-layer layer-name)))
+      (push new-layer configuration-layer--layers)
+      (configuration-layer//configure-layer new-layer))))
 
 (defun configuration-layer//set-layers-variables (layers)
   "Set the configuration variables for the passed LAYERS."
+  (mapc 'configuration-layer//set-layer-variables layers))
+
+(defun configuration-layer//set-layer-variables (layer)
+  "Set the configuration variables for the passed LAYER."
+  (let ((variables (oref layer :variables)))
+    (while variables
+      (let ((var (pop variables)))
+        (if (consp variables)
+            (condition-case err
+                (set-default var (eval (pop variables)))
+              ('error
+               (configuration-layer//set-error)
+               (spacemacs-buffer/append
+                (format (concat "An error occurred while setting layer "
+                                "variable %s "
+                                "(error: %s). Be sure to quote the value "
+                                "if needed.\n") var err))))
+          (spacemacs-buffer/warning "Missing value for variable %s !"
+                                    var))))))
+
+(defun configuration-layer/layer-usedp (name)
+  "Return non-nil if NAME is the name of a used layer."
+  (not (null (object-assoc name :name configuration-layer--layers))))
+
+(defun configuration-layer/package-usedp (name)
+  "Return non-nil if NAME is the name of a used package."
+  (let ((obj (object-assoc name :name configuration-layer--packages)))
+    (when obj (oref obj :owner))))
+
+(defun configuration-layer//configure-layers (layers)
+  "Configure LAYERS."
+  ;; FIFO loading of layers, this allow the user to put her layers at the
+  ;; end of the list to override previous layers.
+  (let ((warning-minimum-level :error))
+    (dolist (l layers)
+      (configuration-layer//configure-layer l))))
+
+(defun configuration-layer//configure-layer (layer)
+  "Configure LAYER."
+  (configuration-layer//set-layer-variables layer)
+  (configuration-layer//load-layer-files layer '("funcs.el"
+                                                 "config.el"
+                                                 "keybindings.el")))
+
+(defun configuration-layer//declare-packages (layers)
+  "Declare all packages contained in LAYERS."
+  (let ((layers2 layers)
+        (warning-minimum-level :error))
+    ;; TODO remove extensions in 0.105.0
+    (configuration-layer//load-layers-files layers2 '("packages.el" "extensions.el"))
+    ;; gather all the packages of current layer
+    (configuration-layer//sort-packages (configuration-layer/get-packages
+                                         layers2 t))))
+
+(defun configuration-layer//load-packages (packages)
+  "Load PACKAGES."
+  ;; number of chuncks for the loading screen
+  (setq spacemacs-loading-dots-chunk-threshold
+        (/ (configuration-layer/configured-packages-count)
+           spacemacs-loading-dots-chunk-count))
+  (configuration-layer//install-packages packages)
+  (configuration-layer//configure-packages packages))
+
+(defun configuration-layer//load-layers-files (layers files)
+  "Load the files of list FILES for all passed LAYERS."
   (dolist (layer layers)
-    (let ((variables (spacemacs/mplist-get layer :variables)))
-      (while variables
-        (let ((var (pop variables)))
-          (if (consp variables)
-              (set-default var (pop variables))
-            (spacemacs/message "Warning: Missing value for variable %s !"
-                               var)))))))
+    (configuration-layer//load-layer-files layer files)))
 
-(defun configuration-layer/package-declaredp (pkg)
-  "Return non-nil if PKG symbol corresponds to a used package."
-  (ht-contains? configuration-layer-all-packages pkg))
+(defun configuration-layer//load-layer-files (layer files)
+  "Load the files of list FILES for the given LAYER."
+  (dolist (file files)
+    (let ((file (concat (oref layer :dir) file)))
+      (if (file-exists-p file) (load file)))))
 
-(defun configuration-layer/get-layers-list ()
-  "Return a list of all discovered layer symbols."
-  (ht-keys configuration-layer-paths))
+(defun configuration-layer/configured-packages-count ()
+  "Return the number of configured packages."
+  (length configuration-layer--packages))
 
-(defun configuration-layer/get-layer-path (layer)
-  "Return the path for LAYER symbol."
-  (ht-get configuration-layer-paths layer))
-
-(defun configuration-layer/load-layers ()
-  "Load all declared layers."
-  (let ((layers (reverse configuration-layer-layers)))
-    (configuration-layer//set-layers-variables layers)
-    (configuration-layer//load-layer-files layers '("funcs.el" "config.el"))
-    ;; fill the hash tables
-    (setq configuration-layer-excluded-packages (configuration-layer/get-excluded-packages layers))
-    (setq configuration-layer-all-packages (configuration-layer/get-packages layers))
-    (setq configuration-layer-all-pre-extensions (configuration-layer/get-extensions layers t))
-    (setq configuration-layer-all-post-extensions (configuration-layer/get-extensions layers))
-    ;; This is what you get when you have no test cases... hopefully I will code
-    ;; them soon :-)
-    ;; (message "excluded: %s" configuration-layer-excluded-packages)
-    ;; (message "packages: %s" configuration-layer-all-packages)
-    ;; (message "pre-extensions: %s" configuration-layer-all-pre-extensions)
-    ;; (message "post-extensions: %s" configuration-layer-all-post-extensions)
-    ;; filter them
-    (let ((excluded (append dotspacemacs-excluded-packages
-                            configuration-layer-excluded-packages)))
-      (configuration-layer//filter-out-excluded configuration-layer-all-packages excluded)
-      (configuration-layer//filter-out-excluded configuration-layer-all-pre-extensions excluded)
-      (configuration-layer//filter-out-excluded configuration-layer-all-post-extensions excluded))
-    ;; number of chuncks for the loading screen
-    (let ((total (+ (ht-size configuration-layer-all-packages)
-                    (ht-size configuration-layer-all-pre-extensions)
-                    (ht-size configuration-layer-all-post-extensions))))
-      (setq spacemacs-loading-dots-chunk-threshold
-            (/ total spacemacs-loading-dots-chunk-count)))
-    ;; filter them
-    (configuration-layer//sort-packages-and-extensions)
-    ;; install and initialize packages and extensions
-    (configuration-layer//initialize-extensions configuration-layer-all-pre-extensions-sorted t)
-    (configuration-layer//install-packages)
-    (spacemacs/append-to-buffer spacemacs-loading-text)
-    (configuration-layer//initialize-packages)
-    (configuration-layer//initialize-extensions configuration-layer-all-post-extensions-sorted)
-    ;; restore warning level before initialization
-    (setq warning-minimum-level :warning)
-    (configuration-layer//load-layer-files layers '("keybindings.el"))))
-
-(defun configuration-layer//load-layer-files (layers files)
-  "Load the files of list FILES for all LAYERS."
-  (dolist (layer layers)
-    (let* ((sym (car layer))
-           (dir (plist-get (cdr layer) :dir)))
-      (dolist (file files)
-        (let ((file (concat dir file)))
-          (if (file-exists-p file) (configuration-layer/load-file file)))))))
-
-(defsubst configuration-layer//add-layer-to-hash (pkg layer hash)
-  "Add LAYER to the list value stored in HASH with key PKG."
-  (let ((list (ht-get hash pkg)))
-    (eval `(push ',layer list))
-    (puthash pkg list hash)))
-
-(defsubst configuration-layer//filter-out-excluded (hash excluded)
-  "Remove EXCLUDED packages from the hash tables HASH."
-  (dolist (pkg (ht-keys (eval hash)))
-    (when (or (member pkg excluded)) (ht-remove (eval hash) pkg))))
-
-(defun configuration-layer//sort-packages-and-extensions ()
-  "Sort the packages and extensions symbol and store them in
-`configuration-layer-all-packages-sorted'
-`configuration-layer-all-pre-extensions-sorted'
-`configuration-layer-all-post-extensions-sorted'"
-  (setq configuration-layer-all-packages-sorted
-        (configuration-layer/sort-hash-table-keys configuration-layer-all-packages))
-  (setq configuration-layer-all-pre-extensions-sorted
-        (configuration-layer/sort-hash-table-keys configuration-layer-all-pre-extensions))
-  (setq configuration-layer-all-post-extensions-sorted
-        (configuration-layer/sort-hash-table-keys configuration-layer-all-post-extensions)))
-
-(defun configuration-layer/sort-hash-table-keys (h)
-  "Return a sorted list of the keys in the given hash table H."
-  (mapcar 'intern (sort (mapcar 'symbol-name (ht-keys h)) 'string<)))
-
-(defun configuration-layer/load-file (file)
-  "Assure that FILE is loaded only once."
-  (unless (member file configuration-layer--loaded-files)
-    (load file)
-    (push file configuration-layer--loaded-files)))
-
-(defun configuration-layer/get-excluded-packages (layers)
-  "Read `layer-excluded-packages' lists for all passed LAYERS and return a list
-of all excluded packages."
-  (let (result)
-    (dolist (layer layers)
-      (let* ((layer-sym (car layer))
-             (dir (plist-get (cdr layer) :dir))
-             (pkg-file (concat dir "packages.el")))
-        (when (file-exists-p pkg-file)
-          (configuration-layer/load-file pkg-file)
-          (let ((excl-var (intern (format "%s-excluded-packages"
-                                          (symbol-name layer-sym)))))
-            (when (boundp excl-var)
-              (mapc (lambda (x) (push x result)) (eval excl-var)))))))
-    result))
-
-(defun configuration-layer//get-packages-or-extensions (layers file var)
-  "Read the packages or extensions lists for all passed LAYERS and
- return a hash table of all packages where the key is a package symbol.
-
-FILE is a string with value `packages' or `extensions'.
-VAR is a string with value `packages', `pre-extensions' or `post-extensions'."
-  (let ((result (make-hash-table :size 512)))
-    (dolist (layer layers)
-      (let* ((layer-sym (car layer))
-             (dir (plist-get (cdr layer) :dir))
-             (pkg-file (concat dir (format "%s.el" file))))
-        (when (file-exists-p pkg-file)
-          (configuration-layer/load-file pkg-file)
-          (let* ((layer-name (symbol-name layer-sym))
-                 (packages-var (intern (format "%s-%s" layer-name var))))
-            (when (boundp packages-var)
-              (dolist (pkg (eval packages-var))
-                (puthash pkg (cons layer-sym (ht-get result pkg)) result)))))))
-    result))
-
-(defun configuration-layer/get-packages (layers)
-  "Read `layer-packages' lists for all passed LAYERS and return a hash table
-of all packages where the key is a package symbol."
-  (configuration-layer//get-packages-or-extensions layers "packages" "packages"))
-
-(defun configuration-layer/get-extensions (layers &optional pre)
-  "Read `layer-pre-extensions' or `layer-post-extensions' lists for all passed
-LAYERS and return a hash table of all packages where the key is a package
-symbol.
-If PRE is non nil then `layer-pre-extensions' is read instead of
- `layer-post-extensions'."
-  (let ((var (if pre "pre-extensions" "post-extensions")))
-    (configuration-layer//get-packages-or-extensions layers "extensions" var)))
-
-(defun configuration-layer//install-packages ()
-  "Install the packages all the packages if there are not currently installed."
+(defun configuration-layer//install-packages (packages)
+  "Install PACKAGES."
   (interactive)
-  (let* ((not-installed (remove-if 'package-installed-p
-                                   configuration-layer-all-packages-sorted))
-         (not-installed-count (length not-installed)))
+  (let* ((noinst-pkg-names
+          (configuration-layer//get-uninstalled-packages
+           (mapcar 'car
+                   (object-assoc-list
+                    :name configuration-layer--used-distant-packages))))
+         (noinst-count (length noinst-pkg-names)))
     ;; installation
-    (if not-installed
-        (progn
-          (spacemacs/append-to-buffer
-           (format "Found %s new package(s) to install...\n"
-                   not-installed-count))
-          (spacemacs/append-to-buffer
-           "--> fetching new package repository indexes...\n")
-          (redisplay)
-          (package-refresh-contents)
-          (setq installed-count 0)
-          (dolist (pkg not-installed)
-            (setq installed-count (1+ installed-count))
-            (spacemacs/replace-last-line-of-buffer
-             (format "--> installing %s:%s... [%s/%s]"
-                     (ht-get configuration-layer-all-packages pkg)
-                     pkg
-                     installed-count
-                     not-installed-count) t)
-            (unless (package-installed-p pkg)
-              (if (not (assq pkg package-archive-contents))
-                  (spacemacs/append-to-buffer
-                   (format "\nPackage %s is unavailable. Is the package name misspelled?\n"
-                    pkg))
-                (dolist (dep (configuration-layer//get-package-dependencies-from-archive
-                              pkg))
-                  (configuration-layer//activate-package (car dep)))
-                (package-install pkg)))
-            (redisplay))
-          (spacemacs/append-to-buffer "\n")))))
+    (when noinst-pkg-names
+      (spacemacs-buffer/append
+       (format "Found %s new package(s) to install...\n"
+               noinst-count))
+      (spacemacs-buffer/append
+       "--> fetching new package repository indexes...\n")
+      (spacemacs//redisplay)
+      (package-refresh-contents)
+      (setq installed-count 0)
+      (dolist (pkg-name noinst-pkg-names)
+        (setq installed-count (1+ installed-count))
+        (let* ((pkg (object-assoc pkg-name :name configuration-layer--packages))
+               (layer (when pkg (oref pkg :owner)))
+               (location (when pkg (oref pkg :location))))
+          (spacemacs-buffer/replace-last-line
+           (format "--> installing %s%s... [%s/%s]"
+                   (if layer (format "%S:" layer) "dependency ")
+                   pkg-name installed-count noinst-count) t)
+          (unless (package-installed-p pkg-name)
+            (condition-case err
+                (cond
+                 ((or (null pkg) (eq 'elpa location))
+                  (configuration-layer//install-from-elpa pkg-name))
+                 ((and (listp location) (eq 'recipe (car location)))
+                  (configuration-layer//install-from-recipe pkg))
+                 (t (spacemacs-buffer/warning "Cannot install package %S."
+                                              pkg-name)))
+              ('error
+               (configuration-layer//set-error)
+               (spacemacs-buffer/append
+                (format (concat "An error occurred while installing %s "
+                                "(error: %s)\n") pkg-name err))))))
+        (spacemacs//redisplay))
+      (spacemacs-buffer/append "\n"))))
 
-(defun configuration-layer/update-packages ()
-  "Upgrade elpa packages"
-  (interactive)
-  (spacemacs/append-to-buffer
+(defun configuration-layer//install-from-elpa (pkg-name)
+  "Install PKG from ELPA."
+  (if (not (assq pkg-name package-archive-contents))
+      (spacemacs-buffer/append
+       (format (concat "\nPackage %s is unavailable. "
+                       "Is the package name misspelled?\n")
+               pkg-name))
+    (dolist
+        (dep (configuration-layer//get-package-deps-from-archive
+              pkg-name))
+      (configuration-layer//activate-package (car dep)))
+    (package-install pkg-name)))
+
+(defun configuration-layer//install-from-recipe (pkg)
+  "Install PKG from a recipe."
+  (let* ((pkg-name (oref pkg :name))
+         (layer (oref pkg :owner))
+         (recipe (cons pkg-name (cdr (oref pkg :location)))))
+    (if recipe
+        (quelpa recipe)
+      (spacemacs-buffer/warning
+       (concat "Cannot find any recipe for package %S! Be sure "
+               "to add a recipe for it in alist %S.")
+       pkg-name recipes-var))))
+
+(defun configuration-layer//filter-packages-with-deps
+    (pkg-names filter &optional use-archive)
+  "Return a filtered PACKAGES list where each elements satisfies FILTER."
+  (when pkg-names
+    (let (result)
+      (dolist (pkg-name pkg-names)
+        ;; recursively check dependencies
+        (let* ((deps
+                (if use-archive
+                    (configuration-layer//get-package-deps-from-archive
+                     pkg-name)
+                  (configuration-layer//get-package-deps-from-alist pkg-name)))
+               (install-deps
+                (when deps (configuration-layer//filter-packages-with-deps
+                            (mapcar 'car deps) filter))))
+          (when install-deps
+            (setq result (append install-deps result))))
+        (when (funcall filter pkg-name)
+          (add-to-list 'result pkg-name t)))
+      (delete-dups result))))
+
+(defun configuration-layer//get-uninstalled-packages (pkg-names)
+  "Return a filtered list of PKG-NAMES to install."
+  (configuration-layer//filter-packages-with-deps
+   pkg-names (lambda (x) (not (package-installed-p x)))))
+
+(defun configuration-layer//package-has-recipe-p (pkg-name)
+  "Return non nil if PKG-NAME is the name of a package declared with a recipe."
+  (when (object-assoc pkg-name :name configuration-layer--packages)
+    (let* ((pkg (object-assoc pkg-name :name configuration-layer--packages))
+           (location (oref pkg :location)))
+      (and (listp location) (eq 'recipe (car location))))))
+
+(defun configuration-layer//get-package-recipe (pkg-name)
+  "Return the recipe for PGK-NAME if it has one."
+  (let ((pkg (object-assoc pkg-name :name configuration-layer--packages)))
+    (when pkg
+      (let ((location (oref pkg :location)))
+        (when (and (listp location) (eq 'recipe (car location)))
+          location)))))
+
+(defun configuration-layer//new-version-available-p (pkg-name)
+  "Return non nil if there is a new version available for PKG-NAME."
+  (let ((recipe (configuration-layer//get-package-recipe pkg-name))
+        (cur-version (configuration-layer//get-package-version-string pkg-name))
+        new-version)
+    (when cur-version
+      (setq new-version
+            (if recipe
+                (quelpa-checkout recipe (expand-file-name (symbol-name pkg-name)
+                                                          quelpa-build-dir))
+              (configuration-layer//get-latest-package-version-string
+               pkg-name)))
+      ;; (message "%s: %s > %s ?" pkg-name cur-version new-version)
+      (if new-version
+          (version< cur-version new-version)
+        (cl-pushnew pkg-name configuration-layer--skipped-packages :test #'eq)
+        nil))))
+
+(defun configuration-layer//get-packages-to-update (pkg-names)
+  "Return a filtered list of PKG-NAMES to update."
+  (configuration-layer//filter-packages-with-deps
+   pkg-names 'configuration-layer//new-version-available-p 'use-archive))
+
+(defun configuration-layer//configure-packages (packages)
+  "Configure all passed PACKAGES honoring the steps order."
+  (configuration-layer//configure-packages-2
+   (configuration-layer/filter-objects
+    packages (lambda (x) (eq 'pre (oref x :step)))))
+  (configuration-layer//configure-packages-2
+   (configuration-layer/filter-objects
+    packages (lambda (x) (null (oref x :step))))))
+
+(defun configuration-layer//configure-packages-2 (packages)
+  "Configure all passed PACKAGES."
+  (dolist (pkg packages)
+    (spacemacs-buffer/loading-animation)
+    (let ((pkg-name (oref pkg :name)))
+      (cond
+       ((oref pkg :excluded)
+        (spacemacs-buffer/message
+         (format "%S ignored since it has been excluded." pkg-name)))
+       ((null (oref pkg :owner))
+        (spacemacs-buffer/message
+         (format "%S ignored since it has no owner layer." pkg-name)))
+       (t
+        ;; load-path
+        (when (eq 'local (oref pkg :location))
+          (if (eq 'dotfile (oref pkg :owner))
+              ;; local packages owned by dotfile are stored in private/local
+              (push (file-name-as-directory
+                     (concat configuration-layer-private-directory
+                             "local/"
+                             (symbol-name (oref pkg :name))))
+                    load-path)
+            (let* ((owner (object-assoc (oref pkg :owner)
+                                        :name configuration-layer--layers))
+                   (dir (when owner (oref owner :dir))))
+              (push (format "%slocal/%S/" dir pkg-name) load-path)
+              ;; TODO remove extensions in 0.105.0
+              (push (format "%sextensions/%S/" dir pkg-name) load-path))))
+        ;; configuration
+        (cond
+         ((eq 'dotfile (oref pkg :owner))
+          (configuration-layer//activate-package pkg-name)
+          (spacemacs-buffer/message
+           (format "%S is configured in the dotfile." pkg-name)))
+         (t
+          (configuration-layer//activate-package pkg-name)
+          (configuration-layer//configure-package pkg))))))))
+
+(defun configuration-layer//configure-package (pkg)
+  "Configure PKG."
+  (let* ((pkg-name (oref pkg :name))
+         (owner (oref pkg :owner))
+         (owner-layer (object-assoc owner :name configuration-layer--layers))
+         (disabled-for-layers (oref owner-layer :disabled-for)))
+    (spacemacs-buffer/message (format "Configuring %S..." pkg-name))
+    ;; pre-init
+    (mapc (lambda (layer)
+            (if (memq layer disabled-for-layers)
+                (spacemacs-buffer/message
+                 (format "  -> ignored pre-init (%S)..." layer))
+              (spacemacs-buffer/message
+               (format "  -> pre-init (%S)..." layer))
+              (condition-case err
+                  (funcall (intern (format "%S/pre-init-%S" layer pkg-name)))
+                ('error
+                 (configuration-layer//set-error)
+                 (spacemacs-buffer/append
+                  (format
+                   (concat "An error occurred while pre-configuring %S "
+                           "in layer %S (error: %s)\n")
+                   pkg-name layer err))))))
+          (oref pkg :pre-layers))
+    ;; init
+    (spacemacs-buffer/message (format "  -> init (%S)..." owner))
+    (funcall (intern (format "%S/init-%S" owner pkg-name)))
+    ;; post-init
+    (mapc (lambda (layer)
+            (if (memq layer disabled-for-layers)
+                (spacemacs-buffer/message
+                 (format "  -> ignored post-init (%S)..." layer))
+              (spacemacs-buffer/message
+               (format "  -> post-init (%S)..." layer))
+              (condition-case err
+                  (funcall (intern (format "%S/post-init-%S" layer pkg-name)))
+                ('error
+                 (configuration-layer//set-error)
+                 (spacemacs-buffer/append
+                  (format
+                   (concat "An error occurred while post-configuring %S "
+                           "in layer %S (error: %s)\n")
+                   pkg-name layer err))))))
+          (oref pkg :post-layers))))
+
+(defun configuration-layer/update-packages (&optional always-update)
+  "Update packages.
+
+If called with a prefix argument ALWAYS-UPDATE, assume yes to update."
+  (interactive "P")
+  (spacemacs-buffer/insert-page-break)
+  (spacemacs-buffer/append
    "\nUpdating Spacemacs... (for now only ELPA packages are updated)\n")
-  (spacemacs/append-to-buffer
+  (spacemacs-buffer/append
    "--> fetching new package repository indexes...\n")
-  (redisplay)
+  (spacemacs//redisplay)
   (package-refresh-contents)
-  (setq upgraded-count 0)
-  (dolist (pkg configuration-layer-all-packages-sorted)
-    ;; do not stop with errors on builtins and compilation fails
-    (ignore-errors
-      (let ((installed-version (configuration-layer//get-package-version pkg))
-            (newest-version (configuration-layer//get-latest-package-version pkg)))
-        ;; (message "package - %s" pkg)
-        ;; (message "installed - %s" installed-version)
-        ;; (message "latest - %s" newest-version)
-        (unless (version<= newest-version installed-version)
-          (progn 
+  (setq configuration-layer--skipped-packages nil)
+  (let* ((update-packages
+          (configuration-layer//get-packages-to-update
+           (mapcar 'car (object-assoc-list
+                         :name configuration-layer--used-distant-packages))))
+         (skipped-count (length configuration-layer--skipped-packages))
+         (date (format-time-string "%y-%m-%d_%H.%M.%S"))
+         (rollback-dir (expand-file-name
+                        (concat configuration-layer-rollback-directory
+                                (file-name-as-directory date))))
+         (upgrade-count (length update-packages))
+         (upgraded-count 0)
+         (update-packages-alist))
+    (when configuration-layer--skipped-packages
+      (spacemacs-buffer/append
+       (format (concat "--> Warning: cannot update %s package(s), possibly due"
+                       " to a temporary network problem: %s\n")
+               skipped-count
+               (mapconcat #'symbol-name
+                          configuration-layer--skipped-packages
+                          " "))))
+    ;; (message "packages to udpate: %s" update-packages)
+    (if (> upgrade-count 0)
+        (if (and (not always-update)
+                 (not (yes-or-no-p (format (concat "%s package(s) to update, "
+                                                   (if (> skipped-count 0)
+                                                       (format "%s package(s) skipped, "
+                                                               skipped-count)
+                                                     "")
+                                                   "do you want to continue ? ")
+                                           upgrade-count))))
+            (spacemacs-buffer/append
+             "Packages update has been cancelled.\n")
+          ;; backup the package directory and construct an alist
+          ;; variable to be cached for easy update and rollback
+          (spacemacs-buffer/append
+           "--> performing backup of package(s) to update...\n" t)
+          (spacemacs//redisplay)
+          (dolist (pkg update-packages)
+            (let* ((src-dir (configuration-layer//get-package-directory pkg))
+                   (dest-dir (expand-file-name
+                              (concat rollback-dir
+                                      (file-name-as-directory
+                                       (file-name-nondirectory src-dir))))))
+              (copy-directory src-dir dest-dir 'keeptime 'create 'copy-content)
+              (push (cons pkg (file-name-nondirectory src-dir))
+                    update-packages-alist)))
+          (spacemacs/dump-vars-to-file
+           '(update-packages-alist)
+           (expand-file-name (concat rollback-dir
+                                     configuration-layer-rollback-info)))
+          (dolist (pkg update-packages)
             (setq upgraded-count (1+ upgraded-count))
-            (spacemacs/replace-last-line-of-buffer
-             (format "--> updating packge %s:%s (%s)..."
-                     (ht-get configuration-layer-all-packages pkg)
-                     pkg
-                     upgraded-count
-                     ))
-            (redisplay)
-            (configuration-layer//package-delete pkg)
-            (package-install pkg)
-            )))))
-  (spacemacs/append-to-buffer
-   (format (concat (if (> upgraded-count 0) "\n" "")
-                   "--> %s packages updated.\n")
-           upgraded-count))
-  (redisplay))
+            (spacemacs-buffer/replace-last-line
+             (format "--> preparing update of package %s... [%s/%s]"
+                     pkg upgraded-count upgrade-count) t)
+            (spacemacs//redisplay)
+            (configuration-layer//package-delete pkg))
+          (spacemacs-buffer/append
+           (format "\n--> %s package(s) to be updated.\n" upgraded-count))
+          (spacemacs-buffer/append
+           "\nEmacs has to be restarted to actually install the new packages.\n")
+          (spacemacs//redisplay))
+      (spacemacs-buffer/append "--> All packages are up to date.\n")
+      (spacemacs//redisplay))))
 
-(defun configuration-layer//initialize-packages ()
-  "Initialize all the declared packages."
-  (mapc (lambda (x) (configuration-layer//initialize-package
-                     x (ht-get configuration-layer-all-packages x)))
-        configuration-layer-all-packages-sorted))
+(defun configuration-layer//ido-candidate-rollback-slot ()
+  "Return a list of candidates to select a rollback slot."
+  (let ((rolldir configuration-layer-rollback-directory))
+    (when (file-exists-p rolldir)
+      (reverse
+       (delq nil (mapcar
+                  (lambda (x)
+                    (when (not (or (string= "." x) (string= ".." x)))
+                      (let ((p (length (directory-files (file-name-as-directory
+                                                         (concat rolldir x))))))
+                        ;; -3 for . .. and rollback-info
+                        (format "%s (%s packages)" x (- p 3)))))
+                  (directory-files rolldir)))))))
 
-(defun configuration-layer//initialize-package (pkg layers)
-  "Initialize the package PKG from the configuration layers LAYERS."
-  (dolist (layer layers)
-    (let* ((init-func (intern (format "%s/init-%s" layer pkg))))
-      (spacemacs/loading-animation)
-      (if (and (package-installed-p pkg) (fboundp init-func))
-          (progn
-            (spacemacs/message "Package: Initializing %s:%s..." layer pkg)
-            (configuration-layer//activate-package pkg)
-            (funcall init-func))))))
+(defun configuration-layer/rollback (slot)
+  "Rollback all the packages in the given SLOT.
+If called interactively and SLOT is nil then an ido buffers appears
+to select one."
+  (interactive
+   (list
+    (if (boundp 'slot) slot
+      (let ((candidates (configuration-layer//ido-candidate-rollback-slot)))
+        (when candidates
+          (ido-completing-read "Rollback slots (most recent are first): "
+                               candidates))))))
+  (spacemacs-buffer/insert-page-break)
+  (if (not slot)
+      (message "No rollback slot available.")
+    (string-match "^\\(.+?\\)\s.*$" slot)
+    (let* ((slot-dir (match-string 1 slot))
+           (rollback-dir (file-name-as-directory
+                          (concat configuration-layer-rollback-directory
+                                  (file-name-as-directory slot-dir))))
+           (info-file (expand-file-name
+                       (concat rollback-dir
+                               configuration-layer-rollback-info))))
+      (spacemacs-buffer/append
+       (format "\nRollbacking ELPA packages from slot %s...\n" slot-dir))
+      (load-file info-file)
+      (let ((rollback-count (length update-packages-alist))
+            (rollbacked-count 0))
+        (spacemacs-buffer/append
+         (format "Found %s package(s) to rollback...\n" rollback-count))
+        (spacemacs//redisplay)
+        (dolist (apkg update-packages-alist)
+          (let* ((pkg (car apkg))
+                 (pkg-dir-name (cdr apkg))
+                 (installed-ver
+                  (configuration-layer//get-package-version-string pkg))
+                 (elpa-dir (concat user-emacs-directory "elpa/"))
+                 (src-dir (expand-file-name
+                           (concat rollback-dir (file-name-as-directory
+                                                 pkg-dir-name))))
+                 (dest-dir (expand-file-name
+                            (concat elpa-dir (file-name-as-directory
+                                              pkg-dir-name)))))
+            (setq rollbacked-count (1+ rollbacked-count))
+            (if (string-equal (format "%S-%s" pkg installed-ver) pkg-dir-name)
+                (spacemacs-buffer/replace-last-line
+                 (format "--> package %s already rollbacked! [%s/%s]"
+                         pkg rollbacked-count rollback-count) t)
+              ;; rollback the package
+              (spacemacs-buffer/replace-last-line
+               (format "--> rollbacking package %s... [%s/%s]"
+                       pkg rollbacked-count rollback-count) t)
+              (configuration-layer//package-delete pkg)
+              (copy-directory src-dir dest-dir 'keeptime 'create 'copy-content))
+            (spacemacs//redisplay)))
+        (spacemacs-buffer/append
+         (format "\n--> %s packages rollbacked.\n" rollbacked-count))
+        (spacemacs-buffer/append
+         "\nEmacs has to be restarted for the changes to take effect.\n")))))
 
 (defun configuration-layer//activate-package (pkg)
   "Activate PKG."
@@ -453,50 +976,29 @@ If PRE is non nil then `layer-pre-extensions' is read instead of
       (package-activate pkg '(0 0 0 0))
     (package-activate pkg)))
 
-(defun configuration-layer//initialize-pre-extension (ext layers)
-  "Initialize the pre-extensions EXT from configuration layers LAYERS."
-  (configuration-layer//initialize-extension ext layers t))
+(defun configuration-layer/get-layers-list ()
+  "Return a list of all discovered layer symbols."
+  (ht-keys configuration-layer-paths))
 
-(defun configuration-layer//initialize-extensions (ext-list &optional pre)
-  "Initialize all the declared extensions in EXT-LIST hash table.
-If PRE is non nil then the extensions are pre-extensions."
-  (let ((func (if pre 'configuration-layer//initialize-pre-extension
-                'configuration-layer//initialize-extension))
-        (hash (if pre configuration-layer-all-pre-extensions
-                configuration-layer-all-post-extensions)))
-    (mapc (lambda (x) (funcall func x (ht-get hash x))) ext-list)))
+(defun configuration-layer/get-layer-property (layer slot)
+  "Return the value of SLOT for the given LAYER."
+  (slot-value (object-assoc layer :name configuration-layer--layers) slot))
 
-(defun configuration-layer//initialize-extension (ext layers &optional pre)
-  "Initialize the extension EXT from the configuration layers LAYERS.
-If PRE is non nil then the extension is a pre-extensions."
-  (dolist (layer layers)
-    (let* ((l (assq layer configuration-layer-layers))
-           (ext-dir (plist-get (cdr l) :ext-dir))
-           (init-func (intern (format "%s/init-%s" layer ext))))
-      (add-to-list 'load-path (format "%s%s/" ext-dir ext))
-      (spacemacs/loading-animation)
-      (spacemacs/message "%s-extension: Initializing %s:%s..."
-                         (if pre "Pre" "Post") layer ext)
-      (if (fboundp init-func) (funcall init-func)))))
+(defun configuration-layer/get-layer-local-dir (layer)
+  "Return the value of SLOT for the given LAYER."
+  (concat (slot-value (object-assoc layer :name configuration-layer--layers)
+                      :dir) "local/"))
 
-(defun configuration-layer//initialized-packages-count ()
-  "Return the number of initialized packages and extensions."
-  (+ (ht-size configuration-layer-all-packages)
-     (ht-size configuration-layer-all-pre-extensions)
-     (ht-size configuration-layer-all-post-extensions)))
-
-(defun configuration-layer/get-layer-property (symlayer prop)
-  "Return the value of the PROPerty for the given SYMLAYER symbol."
-  (let* ((layer (assq symlayer configuration-layer-layers)))
-         (plist-get (cdr layer) prop)))
+(defun configuration-layer/get-layer-path (layer)
+  "Return the path for LAYER symbol."
+  (ht-get configuration-layer-paths layer))
 
 (defun configuration-layer//get-packages-dependencies ()
-  "Returns a hash map where key is a dependency package symbol and value is
-a list of all packages which depend on it."
-  (let ((result (make-hash-table :size 200)))
+  "Returns dependencies hash map for all packages in `package-alist'."
+  (let ((result (make-hash-table :size 512)))
     (dolist (pkg package-alist)
       (let* ((pkg-sym (car pkg))
-             (deps (configuration-layer//get-package-dependencies pkg-sym)))
+             (deps (configuration-layer//get-package-deps-from-alist pkg-sym)))
         (dolist (dep deps)
           (let* ((dep-sym (car dep))
                  (value (ht-get result dep-sym)))
@@ -505,125 +1007,159 @@ a list of all packages which depend on it."
                      result)))))
     result))
 
-(defun configuration-layer//get-implicit-packages ()
-  "Returns a list of all packages in `packages-alist' which are not found
-in `configuration-layer-all-packages'"
-  (let ((imp-pkgs))
+(defun configuration-layer//get-implicit-packages (packages)
+  "Returns packages in `packages-alist' which are not found in PACKAGES."
+  (let (imp-pkgs)
     (dolist (pkg package-alist)
       (let ((pkg-sym (car pkg)))
-        (if (not (ht-contains? configuration-layer-all-packages pkg-sym))
-            (add-to-list 'imp-pkgs pkg-sym))))
+        (unless (object-assoc pkg-sym :name packages)
+          (add-to-list 'imp-pkgs pkg-sym))))
     imp-pkgs))
 
-(defun configuration-layer//get-orphan-packages (implicit-pkgs dependencies)
-  "Return a list of all orphan packages which are basically meant to be
-deleted safely."
-  (let ((result '()))
+(defun configuration-layer//get-orphan-packages
+    (dist-pkgs implicit-pkgs dependencies)
+  "Return orphan packages."
+  (let (result)
     (dolist (imp-pkg implicit-pkgs)
-      (if (configuration-layer//is-package-orphan imp-pkg dependencies)
-          (add-to-list 'result imp-pkg)))
+      (when (configuration-layer//is-package-orphan
+             imp-pkg dist-pkgs dependencies)
+        (add-to-list 'result imp-pkg)))
     result))
 
-(defun configuration-layer//is-package-orphan (pkg dependencies)
-  "Returns not nil if PKG is an orphan package."
-  (if (ht-contains? configuration-layer-all-packages pkg)
-      nil
-    (if (ht-contains? dependencies pkg)
-        (let ((parents (ht-get dependencies pkg)))
+(defun configuration-layer//is-package-orphan (pkg-name dist-pkgs dependencies)
+  "Returns not nil if PKG-NAME is the name of an orphan package."
+  (unless (or (object-assoc pkg-name :name dist-pkgs)
+              (memq pkg-name configuration-layer--protected-packages))
+    (if (ht-contains? dependencies pkg-name)
+        (let ((parents (ht-get dependencies pkg-name)))
           (reduce (lambda (x y) (and x y))
                   (mapcar (lambda (p) (configuration-layer//is-package-orphan
-                                       p dependencies))
+                                       p dist-pkgs dependencies))
                           parents)
                   :initial-value t))
-      (not (ht-contains? configuration-layer-all-packages pkg)))))
+      (not (object-assoc pkg-name :name dist-pkgs)))))
 
-(defun configuration-layer//get-package-dependencies (package)
-  "Return the dependencies alist for PACKAGE."
-  (let ((pkg (assq package package-alist)))
+(defun configuration-layer//get-package-directory (pkg-name)
+  "Return the directory path for package with name PKG-NAME."
+  (let ((pkg-desc (assq pkg-name package-alist)))
     (cond
-     ((version< emacs-version "24.3.50") (aref (cdr pkg) 1))
-     (t (package-desc-reqs (cadr pkg))))))
+     ((version< emacs-version "24.3.50")
+      (let* ((version (aref (cdr pkg-desc) 0))
+             (elpa-dir (concat user-emacs-directory "elpa/"))
+             (pkg-dir-name (format "%s-%s.%s"
+                                   (symbol-name pkg-name)
+                                   (car version)
+                                   (cadr version))))
+        (expand-file-name (concat elpa-dir pkg-dir-name))))
+     (t (package-desc-dir (cadr pkg-desc))))))
 
-(defun configuration-layer//get-package-dependencies-from-archive (pkg)
-  "Return the dependencies alist for a PKG from the archive data."
-  (let* ((arch (assq pkg package-archive-contents))
-         (reqs (when arch (if (version< emacs-version "24.3.50")
-                              (aref (cdr arch) 1)
-                            (package-desc-reqs (cadr arch))))))
+(defun configuration-layer//get-package-deps-from-alist (pkg-name)
+  "Return the dependencies alist for package with name PKG-NAME."
+  (let ((pkg-desc (assq pkg-name package-alist)))
+    (when pkg-desc
+      (cond
+       ((version< emacs-version "24.3.50") (aref (cdr pkg-desc) 1))
+       (t (package-desc-reqs (cadr pkg-desc)))))))
+
+(defun configuration-layer//get-package-deps-from-archive (pkg-name)
+  "Return the dependencies alist for a PKG-NAME from the archive data."
+  (let* ((pkg-arch (assq pkg-name package-archive-contents))
+         (reqs (when pkg-arch (if (version< emacs-version "24.3.50")
+                              (aref (cdr pkg-arch) 1)
+                            (package-desc-reqs (cadr pkg-arch))))))
     ;; recursively get the requirements of reqs
     (dolist (req reqs)
-      (let* ((pkg2 (car req))
-             (reqs2 (configuration-layer//get-package-dependencies-from-archive pkg2)))
+      (let* ((pkg-name2 (car req))
+             (reqs2 (configuration-layer//get-package-deps-from-archive
+                     pkg-name2)))
         (when reqs2 (setq reqs (append reqs2 reqs)))))
     reqs))
 
-(defun configuration-layer//get-package-version (package)
-  "Return the version string for PACKAGE."
-  (let ((pkg (or (assq package package-alist)
-                 (assq package package--builtins))))
-    (cond
-     ((version< emacs-version "24.3.50") (package-version-join (aref (cdr pkg) 0)))
-     (t (package-version-join (package-desc-version (cadr pkg)))))))
+(defun configuration-layer//get-package-version-string (pkg-name)
+  "Return the version string for package with name PKG-NAME."
+  (let ((pkg-desc (assq pkg-name package-alist)))
+    (when pkg-desc
+      (cond
+       ((version< emacs-version "24.3.50") (package-version-join
+                                            (aref (cdr pkg-desc) 0)))
+       (t (package-version-join (package-desc-version (cadr pkg-desc))))))))
 
-(defun configuration-layer//get-latest-package-version (package)
-  "Return the version string for PACKAGE."
-  (let ((pkg (assq package package-archive-contents)))
-    (cond
-     ((version< emacs-version "24.3.50") (package-version-join (aref (cdr pkg) 0)))
-     (t (package-version-join (package-desc-version (cadr pkg)))))))
+(defun configuration-layer//get-package-version (pkg-name)
+  "Return the version list for package with name PKG-NAME."
+  (let ((version-string (configuration-layer//get-package-version-string pkg-name)))
+    (unless (string-empty-p version-string)
+      (version-to-list version-string))))
 
-(defun configuration-layer//package-delete (package)
-  "Delete the passed PACKAGE."
+(defun configuration-layer//get-latest-package-version-string (pkg-name)
+  "Return the version string for package with name PKG-NAME."
+  (let ((pkg-arch (assq pkg-name package-archive-contents)))
+    (when pkg-arch
+      (cond
+       ((version< emacs-version "24.3.50") (package-version-join
+                                            (aref (cdr pkg-arch) 0)))
+       (t (package-version-join (package-desc-version (cadr pkg-arch))))))))
+
+(defun configuration-layer//get-latest-package-version (pkg-name)
+  "Return the versio list for package with name PKG-NAME."
+  (let ((version-string
+         (configuration-layer//get-latest-package-version-string pkg-name)))
+    (unless (string-empty-p version-string)
+      (version-to-list version-string))))
+
+(defun configuration-layer//package-delete (pkg-name)
+  "Delete package with name PKG-NAME."
   (cond
    ((version< emacs-version "24.3.50")
-    (package-delete (symbol-name package)
-                    (configuration-layer//get-package-version package)))
-   (t (package-delete (cadr (assq package package-alist))))))
+    (let ((v (configuration-layer//get-package-version-string pkg-name)))
+      (when v (package-delete (symbol-name pkg-name) v))))
+   ((version<= "25.0.50" emacs-version)
+    (let ((p (cadr (assq pkg-name package-alist))))
+      ;; add force flag to ignore dependency checks in Emacs25
+      (when p (package-delete p t t))))
+   (t (let ((p (cadr (assq pkg-name package-alist))))
+        (when p (package-delete p))))))
 
-(defun configuration-layer/delete-orphan-packages ()
-  "Delete all the orphan packages."
+(defun configuration-layer/delete-orphan-packages (packages)
+  "Delete PACKAGES if they are orphan."
   (interactive)
   (let* ((dependencies (configuration-layer//get-packages-dependencies))
-         (implicit-packages (configuration-layer//get-implicit-packages))
-         (orphans (configuration-layer//get-orphan-packages implicit-packages
-                                                  dependencies))
+         (implicit-packages (configuration-layer//get-implicit-packages
+                             configuration-layer--used-distant-packages))
+         (orphans (configuration-layer//get-orphan-packages
+                   configuration-layer--used-distant-packages
+                   implicit-packages
+                   dependencies))
          (orphans-count (length orphans)))
     ;; (message "dependencies: %s" dependencies)
     ;; (message "implicit: %s" implicit-packages)
     ;; (message "orphans: %s" orphans)
     (if orphans
         (progn
-          ;; for the loading dot bar
-          (spacemacs/append-to-buffer "OK!\n")
-          (spacemacs/append-to-buffer
+          (spacemacs-buffer/append
            (format "Found %s orphan package(s) to delete...\n"
                    orphans-count))
           (setq deleted-count 0)
           (dolist (orphan orphans)
             (setq deleted-count (1+ deleted-count))
-            (spacemacs/replace-last-line-of-buffer
+            (spacemacs-buffer/replace-last-line
              (format "--> deleting %s... [%s/%s]"
                      orphan
                      deleted-count
                      orphans-count) t)
             (configuration-layer//package-delete orphan)
-            (redisplay))
-          (spacemacs/append-to-buffer "\n"))
-      (spacemacs/message "No orphan package to delete."))))
+            (spacemacs//redisplay))
+          (spacemacs-buffer/append "\n"))
+      (spacemacs-buffer/message "No orphan package to delete."))))
 
-(defun configuration-layer/setup-after-init-hook ()
-  "Add post init processing."
-  (add-hook 'after-init-hook
-            (lambda ()
-              (spacemacs/append-to-buffer (format "%s\n" spacemacs-loading-done-text))
-              ;; from jwiegley
-              ;; https://github.com/jwiegley/dot-emacs/blob/master/init.el
-              (let ((elapsed (float-time
-                              (time-subtract (current-time) emacs-start-time))))
-                (spacemacs/append-to-buffer
-                 (format "[%s packages loaded in %.3fs]\n"
-                         (configuration-layer//initialized-packages-count)
-                         elapsed)))
-              (spacemacs/check-for-new-version spacemacs-version-check-interval))))
+(defun configuration-layer//set-error ()
+  "Set the error flag and change the mode-line color to red."
+  (if configuration-layer-error-count
+      (setq configuration-layer-error-count
+            (1+ configuration-layer-error-count))
+    (face-remap-add-relative 'mode-line '((:background "red") mode-line))
+    (setq configuration-layer-error-count 1)))
 
 (provide 'core-configuration-layer)
+
+;;; core-configuration-layer.el ends here
+
