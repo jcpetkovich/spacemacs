@@ -109,7 +109,9 @@
       )
     (define-key ess-mode-map (kbd "<s-return>") 'ess-eval-line)
     (define-key inferior-ess-mode-map (kbd "C-j") 'comint-next-input)
-    (define-key inferior-ess-mode-map (kbd "C-k") 'comint-previous-input)))
+    (define-key inferior-ess-mode-map (kbd "C-k") 'comint-previous-input)
+
+    (evilified-state-evilify ess-help-mode ess-help-mode-map)))
 
 (defun ess/init-ess-R-data-view ())
 
